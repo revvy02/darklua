@@ -299,8 +299,18 @@ impl FileWatcher {
                 }
                 EventKind::Modify(modify_kind) => {
                     if let ModifyKind::Name(_rename_mode) = modify_kind {
+                        // A rename can be a file moving *away* (source gone) or one
+                        // arriving *here* — including an editor "atomic save" (write
+                        // a temp file, then rename it over the target). RenameMode is
+                        // unreliable across platforms (macOS FSEvents often reports
+                        // `Any`), so decide by whether the path still exists: present
+                        // means re-process it; absent means it was renamed away.
                         for path in paths_iterator {
-                            worker_tree.remove_source(path);
+                            if path.exists() {
+                                worker_tree.source_changed(path);
+                            } else {
+                                worker_tree.remove_source(path);
+                            }
                         }
                         has_created = true;
                     } else {
