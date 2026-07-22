@@ -17,29 +17,10 @@ permissions:
   contents: write
 
 jobs:
-  publish-crate:
-    name: Publish darklua crate
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-          profile: minimal
-
-      - name: Publish crate
-        shell: bash
-        run: cargo publish
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
+  # NOTE (fork): upstream publishes the `darklua` crate to crates.io first; a fork
+  # can't, so that job is dropped — this release only builds + uploads binaries
+  # (which is all `ubi`/mise consume).
   create-release:
-    needs: publish-crate
-
     name: Create release
     runs-on: ubuntu-latest
 
