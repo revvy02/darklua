@@ -320,8 +320,22 @@ impl FileWatcher {
                     }
                 }
                 EventKind::Remove(_remove_kind) => {
+                    // Like renames, a remove event can be stale by the time the
+                    // debounced batch is processed: git (checkout, merge) and
+                    // atomic-save editors replace files with unlink+create, and
+                    // the recreate lands in the same debounce window. Removing
+                    // the source then queues its output for deletion, which
+                    // still executes even though later events in the batch
+                    // re-add the file — permanently dropping the output. Decide
+                    // by whether the path exists now: present means re-process,
+                    // absent means actually removed.
                     for path in paths_iterator {
-                        worker_tree.remove_source(path);
+                        if path.exists() {
+                            has_created = true;
+                            worker_tree.source_changed(path);
+                        } else {
+                            worker_tree.remove_source(path);
+                        }
                     }
                 }
                 EventKind::Access(_) | EventKind::Other => {}
