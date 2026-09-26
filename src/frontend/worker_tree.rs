@@ -120,6 +120,9 @@ impl WorkerTree {
             .count();
 
         if total_not_done == 0 {
+            // Removals queue their outputs for deletion but leave nothing to
+            // recompile, so the cleanup must not be skipped with the work.
+            self.clean_files(resources);
             return Ok(());
         }
 
@@ -186,7 +189,7 @@ impl WorkerTree {
                         for path in work_item.external_file_dependencies.iter() {
                             let container = self
                                 .external_dependencies
-                                .entry(path.to_path_buf())
+                                .entry(normalize_path(path))
                                 .or_default();
 
                             if !container.contains(&node_index) {
@@ -366,6 +369,7 @@ impl WorkerTree {
 
             self.graph.remove_node(node_index);
             self.node_map.remove(&path);
+            self.unlink_external_dependencies(node_index);
         } else {
             let mut remove_nodes = Vec::new();
 
@@ -379,16 +383,58 @@ impl WorkerTree {
             });
 
             for node_index in remove_nodes {
+                // Dependents outside the removed directory must re-process, just
+                // like when a single file is removed.
+                self.restart_work(node_index);
+
                 if let Some(work_item) = self.graph.remove_node(node_index) {
                     if !work_item.data.is_in_place() {
                         self.remove_files
                             .push(work_item.data.output().to_path_buf());
                     }
                 }
+                self.unlink_external_dependencies(node_index);
             }
         }
 
         self.update_external_dependencies(&path);
+    }
+
+    /// Removes every source under `path` whose file no longer exists.
+    ///
+    /// A directory renamed over another one (or replaced by a copy) only yields
+    /// events for the directory itself: files that existed under the old name but
+    /// not the new one vanish without a remove event of their own. Reconciling
+    /// against the file system after such a change drops those stale entries and
+    /// queues their outputs for deletion.
+    pub fn remove_missing_sources(&mut self, resources: &Resources, path: impl AsRef<Path>) {
+        let path = normalize_path(path.as_ref());
+
+        let missing: Vec<PathBuf> = self
+            .node_map
+            .keys()
+            .filter(|node_path| node_path.starts_with(&path))
+            .filter(|node_path| !resources.exists(node_path).unwrap_or(true))
+            .cloned()
+            .collect();
+
+        for source in missing {
+            log::debug!(
+                "source `{}` no longer exists, removing it",
+                source.display()
+            );
+            self.remove_source(source);
+        }
+    }
+
+    /// Forget a node index that was removed from the graph. A `NodeIndex` left in
+    /// `external_dependencies` after its node is gone would later be handed to
+    /// `restart_work` (when the external file changes) and index a vacant or
+    /// out-of-bounds graph slot, which panics.
+    fn unlink_external_dependencies(&mut self, node_index: NodeIndex) {
+        for container in self.external_dependencies.values_mut() {
+            container.remove(&node_index);
+        }
     }
 
     /// Checks if a source file is present in the worker tree.
@@ -438,8 +484,8 @@ impl WorkerTree {
 
             log::debug!("restart work for {}", item.source().display());
             for path in item.external_file_dependencies.iter() {
-                if let Some(container) = self.external_dependencies.get_mut(path) {
-                    container.remove(&node_index);
+                if let Some(container) = self.external_dependencies.get_mut(&normalize_path(path)) {
+                    container.remove(&dependent_node);
                 }
             }
             item.reset();
@@ -481,5 +527,132 @@ impl WorkerTree {
         self.output_structure = Some(structure);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn sourcemap() -> PathBuf {
+        PathBuf::from("sourcemap.json")
+    }
+
+    /// Build a tree of three sources that all depend on an external file, the
+    /// way `convert_require` depends on a Rojo sourcemap.
+    fn tree_with_external_dependency() -> (WorkerTree, Vec<NodeIndex>) {
+        let mut tree = WorkerTree::default();
+        let sources = ["src/Pkg2/a.lua", "src/Pkg2/b.lua", "src/Pkg/c.lua"];
+        for source in sources {
+            tree.insert_source(
+                PathBuf::from(source),
+                Some(PathBuf::from(format!("out/{}", source))),
+            );
+        }
+        let indexes: Vec<_> = sources
+            .iter()
+            .map(|s| tree.node_map[Path::new(s)])
+            .collect();
+        tree.external_dependencies
+            .insert(sourcemap(), indexes.iter().copied().collect());
+        (tree, indexes)
+    }
+
+    #[test]
+    fn removing_a_directory_unlinks_its_nodes_from_external_dependencies() {
+        let (mut tree, indexes) = tree_with_external_dependency();
+
+        tree.remove_source("src/Pkg2");
+
+        assert_eq!(
+            tree.external_dependencies[&sourcemap()],
+            HashSet::from([indexes[2]]),
+            "only the surviving node may stay linked to the sourcemap"
+        );
+        // The external file changing must not touch the removed nodes (this
+        // used to panic inside `restart_work`).
+        tree.source_changed(sourcemap());
+        assert_eq!(tree.node_map.len(), 1);
+    }
+
+    #[test]
+    fn removing_a_file_unlinks_it_from_external_dependencies() {
+        let (mut tree, indexes) = tree_with_external_dependency();
+
+        tree.remove_source("src/Pkg/c.lua");
+
+        assert_eq!(
+            tree.external_dependencies[&sourcemap()],
+            HashSet::from([indexes[0], indexes[1]]),
+        );
+        tree.source_changed(sourcemap());
+    }
+
+    #[test]
+    fn removed_directory_outputs_are_cleaned_even_without_pending_work() {
+        let resources = Resources::from_memory();
+        resources.write("src/Pkg/a.lua", "return 1").unwrap();
+        resources.write("src/Pkg/b.lua", "return 2").unwrap();
+        resources.write("src/keep.lua", "return 3").unwrap();
+
+        let options = || Options::new("src").with_output("out");
+        let mut tree = crate::process(&resources, options()).unwrap();
+        assert!(resources.exists("out/Pkg/a.lua").unwrap());
+
+        tree.remove_source("src/Pkg");
+        // Nothing depends on the removed files, so there is no work left: the
+        // cleanup must still run.
+        tree.process(&resources, options()).unwrap();
+
+        assert!(!resources.exists("out/Pkg/a.lua").unwrap());
+        assert!(!resources.exists("out/Pkg/b.lua").unwrap());
+        assert!(resources.exists("out/keep.lua").unwrap());
+    }
+
+    #[test]
+    fn remove_missing_sources_drops_vanished_files_under_a_directory() {
+        let resources = Resources::from_memory();
+        resources.write("src/Pkg/a.lua", "return 1").unwrap();
+        resources.write("src/Pkg/b.lua", "return 2").unwrap();
+
+        let options = || Options::new("src").with_output("out");
+        let mut tree = crate::process(&resources, options()).unwrap();
+
+        resources.remove("src/Pkg/b.lua").unwrap();
+        tree.remove_missing_sources(&resources, "src/Pkg");
+        tree.process(&resources, options()).unwrap();
+
+        assert!(tree.contains("src/Pkg/a.lua"));
+        assert!(!tree.contains("src/Pkg/b.lua"));
+        assert!(!resources.exists("out/Pkg/b.lua").unwrap());
+    }
+
+    #[test]
+    fn external_dependency_keys_are_normalized() {
+        let mut tree = WorkerTree::default();
+        tree.insert_source(PathBuf::from("src/a.lua"), Some(PathBuf::from("out/a.lua")));
+        let index = tree.node_map[Path::new("src/a.lua")];
+        tree.graph
+            .node_weight_mut(index)
+            .unwrap()
+            .external_file_dependencies
+            .insert(PathBuf::from("./sourcemap.json"));
+
+        // Simulate what `process` does when linking dependencies.
+        for path in tree.graph[index].external_file_dependencies.clone() {
+            tree.external_dependencies
+                .entry(normalize_path(&path))
+                .or_default()
+                .insert(index);
+        }
+        // Mark done so a restart is observable.
+        tree.graph[index].status = WorkStatus::done();
+
+        // A file-watch event arrives as the normalized path.
+        tree.source_changed("sourcemap.json");
+        assert!(
+            !tree.graph[index].status.is_done(),
+            "a change to the external file must restart the dependent work"
+        );
     }
 }

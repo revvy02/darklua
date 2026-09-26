@@ -245,6 +245,7 @@ impl FileWatcher {
             return;
         }
         let current_path = self.current_working_path.as_ref();
+        let resources = &self.resources;
 
         let worker_tree = if let Some(worker_tree) = self.worker_tree.as_mut() {
             worker_tree
@@ -295,7 +296,17 @@ impl FileWatcher {
                     }
                 }
                 EventKind::Create(_create_kind) => {
-                    has_created = paths_iterator.next().is_some();
+                    // macOS FSEvents keeps reporting a recently created path as
+                    // "created" on later writes, and the debouncer folds a
+                    // create+modify pair into a single Create. Only collecting
+                    // new work here left in-place edits of known files
+                    // re-processed from cached content, so their output never
+                    // changed. Treat every path as changed, like `Any`.
+                    for path in paths_iterator {
+                        has_created = true;
+                        worker_tree.source_changed(path);
+                        reconcile_directory(worker_tree, resources, path);
+                    }
                 }
                 EventKind::Modify(modify_kind) => {
                     if let ModifyKind::Name(_rename_mode) = modify_kind {
@@ -308,6 +319,7 @@ impl FileWatcher {
                         for path in paths_iterator {
                             if path.exists() {
                                 worker_tree.source_changed(path);
+                                reconcile_directory(worker_tree, resources, path);
                             } else {
                                 worker_tree.remove_source(path);
                             }
@@ -333,6 +345,7 @@ impl FileWatcher {
                         if path.exists() {
                             has_created = true;
                             worker_tree.source_changed(path);
+                            reconcile_directory(worker_tree, resources, path);
                         } else {
                             worker_tree.remove_source(path);
                         }
@@ -340,6 +353,16 @@ impl FileWatcher {
                 }
                 EventKind::Access(_) | EventKind::Other => {}
             }
+        }
+
+        // Remove events can be lost entirely: macOS reports the deletion of a
+        // recently created file with its "created" flag still set, and the
+        // debouncer cancels the pair out. Any other event in the batch (a
+        // sourcemap rewrite, a sibling edit) is a chance to notice sources that
+        // are gone and clean their outputs.
+        let input_path = self.input_path.clone();
+        if let Some(worker_tree) = self.worker_tree.as_mut() {
+            worker_tree.remove_missing_sources(&self.resources, &input_path);
         }
 
         if has_created {
@@ -399,6 +422,15 @@ impl FileWatcher {
         );
 
         self.links_file_watch = new_links;
+    }
+}
+
+/// A directory that still exists after a rename/create/remove event may have
+/// lost files without their own events (e.g. `mv new old` over an existing
+/// directory). Drop the sources that are gone so their outputs get cleaned.
+fn reconcile_directory(worker_tree: &mut WorkerTree, resources: &Resources, path: &Path) {
+    if path.is_dir() {
+        worker_tree.remove_missing_sources(resources, path);
     }
 }
 
