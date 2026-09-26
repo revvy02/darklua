@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env,
     hash::Hash,
     io, iter,
@@ -21,18 +21,24 @@ const DEFAULT_CONFIG_PATHS: [&str; 2] = [".darklua.json", ".darklua.json5"];
 
 enum WatcherSignal {
     Exit,
-    Watch(PathBuf),
+    Watch(PathBuf, RecursiveMode),
     Unwatch(PathBuf),
 }
 
 pub struct FileWatcher {
     input_path: PathBuf,
+    canonical_input_path: Option<PathBuf>,
+    config_paths: Vec<PathBuf>,
     resources: Resources,
     sender: Sender<WatcherSignal>,
     receiver: Option<Receiver<WatcherSignal>>,
     worker_tree: Option<WorkerTree>,
     process_option: ProcessOptions,
+    /// Canonical paths of the watched files outside of the input.
     extra_file_watch: HashSet<PathBuf>,
+    /// Directories watched for those files, from their canonical path to the
+    /// path they are watched with.
+    extra_directory_watch: HashMap<PathBuf, PathBuf>,
     links_file_watch: HashSet<(PathBuf, PathBuf)>,
     current_working_path: Option<PathBuf>,
 }
@@ -41,14 +47,26 @@ impl FileWatcher {
     pub fn new(process_option: &ProcessOptions) -> Self {
         let (sender, receiver) = mpsc::channel();
 
+        let config_paths = match &process_option.config {
+            Some(config) => vec![config.clone()],
+            None => DEFAULT_CONFIG_PATHS
+                .iter()
+                .map(PathBuf::from)
+                .filter(|path| path.exists())
+                .collect(),
+        };
+
         Self {
             input_path: process_option.input_path.clone(),
+            canonical_input_path: process_option.input_path.canonicalize().ok(),
+            config_paths,
             resources: Resources::from_file_system(),
             sender,
             receiver: Some(receiver),
             worker_tree: None,
             process_option: process_option.clone(),
             extra_file_watch: Default::default(),
+            extra_directory_watch: Default::default(),
             links_file_watch: Default::default(),
             current_working_path: env::current_dir().ok(),
         }
@@ -89,11 +107,10 @@ impl FileWatcher {
             .expect("file watcher channel receiver should exist");
 
         let input_path = self.input_path.clone();
-        let config_path = self.process_option.config.clone();
 
         for link_path in iter_all_links(input_path.clone()) {
             if let Ok(link_location) = link_path.read_link() {
-                self.send_watch_signal(&link_location);
+                self.send_watch_signal(&link_location, RecursiveMode::Recursive);
 
                 self.links_file_watch.insert((link_location, link_path));
             }
@@ -104,9 +121,10 @@ impl FileWatcher {
             None,
             move |events: DebounceEventResult| match events {
                 Ok(events) => {
-                    log::debug!("changes detected, re-running process");
-                    self.process_events(events);
-                    self.run_worker_tree();
+                    if self.process_events(events) {
+                        log::debug!("changes detected, re-running process");
+                        self.run_worker_tree();
+                    }
                 }
                 Err(errors) => {
                     for err in errors {
@@ -136,44 +154,14 @@ impl FileWatcher {
                 CliError::new(1)
             })?;
 
-        if let Some(config) = &config_path {
-            log::debug!("start watching provided config path {}", config.display());
-            debouncer
-                .watch(config, RecursiveMode::NonRecursive)
-                .map_err(|err| {
-                    log::error!(
-                        "unable to start watching file system at `{}`: {}",
-                        config.display(),
-                        err
-                    );
-                    CliError::new(1)
-                })?;
-        } else {
-            for path in DEFAULT_CONFIG_PATHS.iter().map(Path::new) {
-                if path.exists() {
-                    log::debug!("start watching default config path {}", path.display());
-                    debouncer
-                        .watch(path, RecursiveMode::NonRecursive)
-                        .map_err(|err| {
-                            log::error!(
-                                "unable to start watching file system at `{}`: {}",
-                                path.display(),
-                                err
-                            );
-                            CliError::new(1)
-                        })?;
-                }
-            }
-        }
-
         log::debug!("waiting for Ctrl-C to close the program");
 
         loop {
             match receiver.recv().expect("Could not receive from channel.") {
                 WatcherSignal::Exit => break,
-                WatcherSignal::Watch(path) => {
+                WatcherSignal::Watch(path, recursive_mode) => {
                     log::debug!("start file watching on '{}'", path.display());
-                    match debouncer.watch(&path, RecursiveMode::Recursive) {
+                    match debouncer.watch(&path, recursive_mode) {
                         Ok(()) => {}
                         Err(err) => {
                             log::error!(
@@ -203,14 +191,14 @@ impl FileWatcher {
         Ok(())
     }
 
-    fn send_watch_signal(&self, link_location: &Path) {
+    fn send_watch_signal(&self, location: &Path, recursive_mode: RecursiveMode) {
         if let Err(err) = self
             .sender
-            .send(WatcherSignal::Watch(link_location.to_path_buf()))
+            .send(WatcherSignal::Watch(location.to_path_buf(), recursive_mode))
         {
             log::warn!(
                 "unable to send signal to watch '{}': {}",
-                link_location.display(),
+                location.display(),
                 err
             );
         }
@@ -240,9 +228,12 @@ impl FileWatcher {
         Ok(())
     }
 
-    fn process_events(&mut self, events: Vec<DebouncedEvent>) {
+    /// Applies the events to the worker tree, and returns whether any of them
+    /// concern the watched files.
+    fn process_events(&mut self, mut events: Vec<DebouncedEvent>) -> bool {
+        self.retain_relevant_events(&mut events);
         if events.is_empty() {
-            return;
+            return false;
         }
         let current_path = self.current_working_path.as_ref();
         let resources = &self.resources;
@@ -250,7 +241,7 @@ impl FileWatcher {
         let worker_tree = if let Some(worker_tree) = self.worker_tree.as_mut() {
             worker_tree
         } else {
-            return;
+            return true;
         };
 
         log::debug!("file watch has detected changes");
@@ -369,6 +360,58 @@ impl FileWatcher {
             self.worker_collect_work();
             self.update_links();
         }
+
+        true
+    }
+
+    /// Drops the events that can't change the output:
+    ///
+    /// - Access events, which include darklua itself opening the
+    ///   configuration or a sourcemap to read it. Re-running on them would
+    ///   read those files again and loop.
+    /// - The paths reported only because they share a directory with a file
+    ///   watched outside of the input, like a log darklua writes to.
+    fn retain_relevant_events(&self, events: &mut Vec<DebouncedEvent>) {
+        events.retain(|event| !event.kind.is_access());
+
+        if self.extra_directory_watch.is_empty() {
+            return;
+        }
+
+        let mut canonical_parents: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
+        let mut is_watched = |path: &Path| {
+            let parent = match path.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent,
+                Some(_) => Path::new("."),
+                None => return true,
+            };
+            let canonical_parent = canonical_parents
+                .entry(parent.to_path_buf())
+                .or_insert_with(|| parent.canonicalize().ok());
+
+            match (canonical_parent.as_ref(), path.file_name()) {
+                (Some(canonical_parent), Some(file_name))
+                    if self.extra_directory_watch.contains_key(canonical_parent) =>
+                {
+                    self.extra_file_watch
+                        .contains(&canonical_parent.join(file_name))
+                        || self
+                            .links_file_watch
+                            .iter()
+                            .any(|(link_location, _)| path.starts_with(link_location))
+                }
+                _ => true,
+            }
+        };
+
+        events.retain_mut(|event| {
+            // Events without paths (like a rescan request) concern everything.
+            if event.event.paths.is_empty() {
+                return true;
+            }
+            event.event.paths.retain(|path| is_watched(path));
+            !event.event.paths.is_empty()
+        });
     }
 
     fn worker_collect_work(&mut self) {
@@ -378,26 +421,69 @@ impl FileWatcher {
         }
     }
 
+    /// Watches the files outside of the input that processing depends on,
+    /// like a Rojo sourcemap, and the configuration file.
+    ///
+    /// Each file is watched through its directory. A watch on the file itself
+    /// follows the file's inode on Linux (inotify), so it stops reporting
+    /// changes once the file is replaced by a rename, which is how Rojo and
+    /// many editors write files atomically.
     fn update_extra_file_watch(&mut self) {
-        if let Some(worker_tree) = self.worker_tree.as_ref() {
-            let files: HashSet<_> = worker_tree
-                .iter_external_dependencies()
-                .map(ToOwned::to_owned)
-                .collect();
+        let dependencies = self
+            .worker_tree
+            .iter()
+            .flat_map(|worker_tree| worker_tree.iter_external_dependencies());
 
-            diff_sets(
-                &files,
-                &self.extra_file_watch,
-                |new_file| {
-                    self.send_watch_signal(new_file);
-                },
-                |last_file| {
-                    self.send_unwatch_signal(last_file);
-                },
-            );
+        let mut files = HashSet::new();
+        let mut directories = HashMap::new();
 
-            self.extra_file_watch = files;
+        for file in self
+            .config_paths
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(dependencies)
+        {
+            let directory = match file.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent,
+                _ => Path::new("."),
+            };
+            let (Ok(canonical_directory), Some(file_name)) =
+                (directory.canonicalize(), file.file_name())
+            else {
+                log::warn!(
+                    "unable to watch '{}': its directory does not exist",
+                    file.display()
+                );
+                continue;
+            };
+
+            files.insert(canonical_directory.join(file_name));
+
+            // Files in the input are already watched with it.
+            let in_input = self
+                .canonical_input_path
+                .as_ref()
+                .is_some_and(|input| canonical_directory.starts_with(input));
+            if !in_input {
+                directories
+                    .entry(canonical_directory)
+                    .or_insert_with(|| directory.to_path_buf());
+            }
         }
+
+        for (canonical_directory, directory) in &self.extra_directory_watch {
+            if !directories.contains_key(canonical_directory) {
+                self.send_unwatch_signal(directory);
+            }
+        }
+        for (canonical_directory, directory) in &directories {
+            if !self.extra_directory_watch.contains_key(canonical_directory) {
+                self.send_watch_signal(directory, RecursiveMode::NonRecursive);
+            }
+        }
+
+        self.extra_file_watch = files;
+        self.extra_directory_watch = directories;
     }
 
     fn update_links(&mut self) {
@@ -414,7 +500,7 @@ impl FileWatcher {
             &new_links,
             &self.links_file_watch,
             |(link_location, _link_path)| {
-                self.send_watch_signal(link_location);
+                self.send_watch_signal(link_location, RecursiveMode::Recursive);
             },
             |(link_location, _link_path)| {
                 self.send_unwatch_signal(link_location);
