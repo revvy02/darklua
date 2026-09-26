@@ -9,6 +9,16 @@ use env_logger::Builder;
 use log::Level;
 
 fn main() {
+    // A panic on the file-watcher thread (notify's debouncer callback) would
+    // otherwise leave the main thread parked on its channel forever: a live
+    // process with a dead watcher that silently stops processing changes. Make
+    // every panic fatal so a supervisor sees a non-zero exit and can restart.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        process::exit(101);
+    }));
+
     let darklua = Darklua::parse();
 
     let filter = darklua.get_log_level_filter();
